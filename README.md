@@ -16,4 +16,3 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - Assembler directives: extern, section, db, etc.
 - Outputs ELF relocatable objects suitable to link with ld (including .text, .data, .strtab, .symbtab, .rela.text, .shstrtab).
 - Only global objects supported currently.
-- 
