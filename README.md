@@ -8,3 +8,12 @@ A basic flex and yacc-based x86 64-bit assembler. This code is largely based on 
 ## License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+
+## Features
+
+- Supports basic x86-64 instructions: mov, push, sub, jmp, lea, syscall, ret, leave, call, REX prefixes, etc. These were needed to support basic Linux syscalls and calling external LibC functions.
+- Assembler directives: extern, section, db, etc.
+- Outputs ELF relocatable objects suitable to link with ld (including .text, .data, .strtab, .symbtab, .rela.text, .shstrtab).
+- Only global objects supported currently.
+- 
