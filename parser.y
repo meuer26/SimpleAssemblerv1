@@ -149,40 +149,89 @@ int main(int argc, char *argv[])
     snprintf(newFileName, sizeof(newFileName), "%s.o", fileName);
     relocatableElfFD = open(newFileName, O_RDWR | O_CREAT | O_TRUNC, 0755);
 
-    // Find the number of relocations needed by searching symbol table for Extern keyword
-    int relocationNumber = 0;
+    // -----------------------------------------------------------------------
+    // Assign every emitted symbol a .symtab index and a .strtab offset.
+    //
+    // ELF requires local symbols to come before global ones, and sh_info must
+    // hold the index of the first global symbol. So we emit in this order:
+    //   pass 0: data objects (msg, msg2)   -> LOCAL  (keeps references from
+    //                                         being preemptible in a PIE)
+    //   pass 1: function labels (_start..) -> GLOBAL (so ld can find _start)
+    //   pass 2: external imports (puts)    -> GLOBAL, undefined
+    // Index 0 and string offset 0 are reserved for the undefined/NUL entry.
+    // -----------------------------------------------------------------------
+    int symIndexCounter = 1;
+    int strOffsetCounter = 1;
+    int firstGlobalIndex = 1;
+
+    for(int pass = 0; pass < 3; ++pass)
+    {
+        if (pass == 1) firstGlobalIndex = symIndexCounter; // locals finished
+
+        for(int entryIterator = 0; entryIterator < symbolTable->totalEntries; ++entryIterator)
+        {
+            char *type = symbolTable[entryIterator].symbolType;
+            int emit = (pass == 0 && !strcmp(type, (char*)"String")) ||
+                       (pass == 1 && !strcmp(type, (char*)"Label")) ||
+                       (pass == 2 && !strcmp(type, (char*)"Extern"));
+            if (emit)
+            {
+                symbolTable[entryIterator].symIndex = symIndexCounter++;
+                symbolTable[entryIterator].strOffset = strOffsetCounter;
+                strOffsetCounter += strlen(symbolTable[entryIterator].symbolName) + 1;
+            }
+        }
+    }
+
+    int numberOfSymbolsNeeded = symIndexCounter; // array size, includes index-0 null
+
+    // Count relocations: one per external call plus one per data reference.
     int numberOfRelocationsNeeded = 0;
     for(int entryIterator = 0; entryIterator < symbolTable->totalEntries; ++entryIterator)
     {
-        if(!strcmp(symbolTable[entryIterator].symbolType, (char*)"Extern"))
+        if(!strcmp(symbolTable[entryIterator].symbolType, (char*)"Extern") ||
+           !strcmp(symbolTable[entryIterator].symbolType, (char*)"RELODATA"))
         {
             numberOfRelocationsNeeded++;
         }
     }
 
-    int numberOfSymbolsNeeded = 1; // since 0 is the undefined symbol, we start at 1
-
-    for(int entryIterator = 0; entryIterator < symbolTable->totalEntries; ++entryIterator)
-    {
-        if((!strcmp(symbolTable[entryIterator].symbolType, (char*)"Label")) || (!strcmp(symbolTable[entryIterator].symbolType, (char*)"Extern")))
-        {
-            numberOfSymbolsNeeded++;
-        }
-
-    }
-
     Elf64_Rela *relocations = malloc(numberOfRelocationsNeeded * sizeof(Elf64_Rela));
+    int relocationNumber = 0;
 
-    // Search the symbol table to assign the offset where the external call references are
+    // External function calls:  call puts  ->  R_X86_64_PLT32
     for(int entryIterator = 0; entryIterator < symbolTable->totalEntries; ++entryIterator)
     {
         if(!strcmp(symbolTable[entryIterator].symbolType, (char*)"Extern"))
         {
-            relocations[relocationNumber].r_offset = symbolTable[entryIterator].symbolLocation + 1;  // Offset to the 00 00 00 00
-            // Since the external reference is the last to be read in the symbol table, it will be the 
-            // last symbol number. 
-            relocations[relocationNumber].r_info = ELF64_R_INFO(numberOfSymbolsNeeded-1, R_X86_64_PLT32); 
-            relocations[relocationNumber].r_addend = -4;  // Adjustment for call instruction
+            relocations[relocationNumber].r_offset = symbolTable[entryIterator].symbolLocation + 1;  // the 00 00 00 00 after the E8 opcode
+            relocations[relocationNumber].r_info = ELF64_R_INFO(symbolTable[entryIterator].symIndex, R_X86_64_PLT32);
+            relocations[relocationNumber].r_addend = -4;  // adjust for the call opcode byte
+            relocationNumber++;
+        }
+    }
+
+    // Data references:  lea reg, [msg]  ->  R_X86_64_PC32 against the data symbol.
+    // This is the fix that lets ld place .data anywhere: instead of the
+    // assembler guessing the displacement, ld computes S + A - P for us.
+    for(int entryIterator = 0; entryIterator < symbolTable->totalEntries; ++entryIterator)
+    {
+        if(!strcmp(symbolTable[entryIterator].symbolType, (char*)"RELODATA"))
+        {
+            // Look up the .data symbol this lea points at, to get its index.
+            int targetIndex = 0;
+            for(int k = 0; k < symbolTable->totalEntries; ++k)
+            {
+                if(!strcmp(symbolTable[k].symbolType, (char*)"String") &&
+                   !strcmp(symbolTable[k].symbolName, symbolTable[entryIterator].symbolName))
+                {
+                    targetIndex = symbolTable[k].symIndex;
+                }
+            }
+
+            relocations[relocationNumber].r_offset = symbolTable[entryIterator].symbolLocation + 3;  // disp32 after REX + opcode + ModRM
+            relocations[relocationNumber].r_info = ELF64_R_INFO(targetIndex, R_X86_64_PC32);
+            relocations[relocationNumber].r_addend = -4;  // disp field sits 4 bytes before the end of the instruction
             relocationNumber++;
         }
     }
@@ -243,32 +292,21 @@ int main(int argc, char *argv[])
     Elf_Scn *strtabSection = elf_newscn(elf);
     Elf_Data *strtabData = elf_newdata(strtabSection);
 
-    int symstrtabDataPtr = 0;
     char symstrtabData[1024];
-    symstrtabDataPtr++;
+    memset(symstrtabData, 0, sizeof(symstrtabData));
 
+    // Write each emitted symbol's name at the .strtab offset assigned above.
     for(int entryIterator = 0; entryIterator < symbolTable->totalEntries; ++entryIterator)
     {
-        if(!strcmp(symbolTable[entryIterator].symbolType, (char*)"Label"))
+        char *type = symbolTable[entryIterator].symbolType;
+        if(!strcmp(type, (char*)"String") || !strcmp(type, (char*)"Label") || !strcmp(type, (char*)"Extern"))
         {
-            strcpy(symstrtabData + symstrtabDataPtr, symbolTable[entryIterator].symbolName);
-            symstrtabDataPtr+= strlen(symbolTable[entryIterator].symbolName);
-            symstrtabDataPtr++;
-        }
-    }
-
-    for(int entryIterator = 0; entryIterator < symbolTable->totalEntries; ++entryIterator)
-    {
-        if(!strcmp(symbolTable[entryIterator].symbolType, (char*)"Extern"))
-        {
-            strcpy(symstrtabData + symstrtabDataPtr, symbolTable[entryIterator].symbolName);
-            symstrtabDataPtr+= strlen(symbolTable[entryIterator].symbolName);
-            symstrtabDataPtr++;
+            strcpy(symstrtabData + symbolTable[entryIterator].strOffset, symbolTable[entryIterator].symbolName);
         }
     }
 
     strtabData->d_buf = symstrtabData;
-    strtabData->d_size = sizeof(symstrtabData);
+    strtabData->d_size = strOffsetCounter;
     strtabData->d_align = 1;
 
     gelf_getshdr(strtabSection, &strtabShdr);
@@ -287,42 +325,37 @@ int main(int argc, char *argv[])
     memset(symbols, 0, sizeof(symbols));
     symbols[0].st_name = 0;  // Undefined
 
-    int symbolIterator = 1; // since zero is the undefined one
-    int globalSymbolPtr = 1;
+    // Fill each symbol at the index assigned earlier. st_value is the symbol's
+    // offset inside its section (.text for functions, .data for data objects);
+    // ld turns that offset into a final address.
     for(int entryIterator = 0; entryIterator < symbolTable->totalEntries; ++entryIterator)
     {
-        if(!strcmp(symbolTable[entryIterator].symbolType, (char*)"Label"))
+        char *type = symbolTable[entryIterator].symbolType;
+        int index = symbolTable[entryIterator].symIndex;
+
+        if(!strcmp(type, (char*)"Label"))
         {
-            symbols[symbolIterator].st_name = globalSymbolPtr; 
-            // STB_GLOBAL = symbol table binding global
-            // STT_FUNC = symbol table type function
-
-            // I am making these all global as ELF wants local variables ordered first in the 
-            // strtab and then globals. For simplicity, making everthing global at this point.
-            // This is work to do later.
-            symbols[symbolIterator].st_info = ELF64_ST_INFO(STB_GLOBAL, STT_FUNC);
-            symbols[symbolIterator].st_shndx = 1;  // .text
-
-            globalSymbolPtr+= strlen(symbolTable[entryIterator].symbolName);
-            globalSymbolPtr++;
-            symbolIterator++;
+            symbols[index].st_name = symbolTable[entryIterator].strOffset;
+            symbols[index].st_info = ELF64_ST_INFO(STB_GLOBAL, STT_FUNC);
+            symbols[index].st_shndx = 1;  // .text
+            symbols[index].st_value = symbolTable[entryIterator].symbolLocation;
         }
-
-    }
-
-    for(int entryIterator = 0; entryIterator < symbolTable->totalEntries; ++entryIterator)
-    {
-        if(!strcmp(symbolTable[entryIterator].symbolType, (char*)"Extern"))
+        else if(!strcmp(type, (char*)"String"))
         {
-            symbols[symbolIterator].st_name = globalSymbolPtr;  
-            symbols[symbolIterator].st_info = ELF64_ST_INFO(STB_GLOBAL, STT_FUNC);
-            symbols[symbolIterator].st_shndx = SHN_UNDEF;
-
-            globalSymbolPtr+= strlen(symbolTable[entryIterator].symbolName);
-            globalSymbolPtr++;
-            symbolIterator++;
+            // Data objects are LOCAL so their PC32 references are resolved at
+            // link time (not left as preemptible dynamic symbols in the PIE).
+            symbols[index].st_name = symbolTable[entryIterator].strOffset;
+            symbols[index].st_info = ELF64_ST_INFO(STB_LOCAL, STT_OBJECT);
+            symbols[index].st_shndx = !strcmp(symbolTable[entryIterator].sectionName, (char*)".data") ? 2 : 1;
+            symbols[index].st_value = symbolTable[entryIterator].symbolLocation;
+            symbols[index].st_size = symbolTable[entryIterator].size;
         }
-
+        else if(!strcmp(type, (char*)"Extern"))
+        {
+            symbols[index].st_name = symbolTable[entryIterator].strOffset;
+            symbols[index].st_info = ELF64_ST_INFO(STB_GLOBAL, STT_FUNC);
+            symbols[index].st_shndx = SHN_UNDEF;
+        }
     }
 
     symtabData->d_buf = symbols;
@@ -336,7 +369,7 @@ int main(int argc, char *argv[])
     symtabShdr.sh_size = symtabData->d_size;
     symtabShdr.sh_addralign = 8;
     symtabShdr.sh_link = elf_ndxscn(strtabSection);  // Link to .strtab (index 3)
-    symtabShdr.sh_info = 1; 
+    symtabShdr.sh_info = firstGlobalIndex;  // index of the first global symbol (locals must precede globals)
     symtabShdr.sh_entsize = sizeof(Elf64_Sym);
     gelf_update_shdr(symtabSection, &symtabShdr);
 
@@ -498,14 +531,30 @@ stmt:
         |
         TOK_LEA TOK_REG64 TOK_COMMA TOK_LBRACKET TOK_LABEL TOK_RBRACKET
         {
+            int leaPosition = textOffset; // where this lea instruction begins in .text
+
+            // If the lea targets a .data symbol, record a tracking entry so the
+            // ELF builder can emit an R_X86_64_PC32 relocation for it. The data
+            // section is declared before .text in the source, so the symbol is
+            // already in the table by the time we reach the lea.
+            for (int entryIterator = 0; entryIterator < symbolTable->totalEntries; ++entryIterator)
+            {
+                if(!strcmp(symbolTable[entryIterator].symbolName, $5) &&
+                   !strcmp(symbolTable[entryIterator].sectionName, (char*)".data"))
+                {
+                    insertSymbol(symbolTable, (char *)"LEA", (char *)"RELODATA", (char*)$5, (char *)".text", leaPosition, 0);
+                    break;
+                }
+            }
+
             if (!strcmp($2, (char*)"rsi"))
             {
-                parserStackPush(parserStack, loadEffectiveAddressRSI($5, textOffset));
+                parserStackPush(parserStack, loadEffectiveAddressRSI($5, leaPosition));
                 textOffset+= 7; // 1 byte rex, 1 byte opcode, 1 byte Mod R/M, 4 byte relative address
             }
             else if (!strcmp($2, (char*)"rdi"))
             {
-                parserStackPush(parserStack, loadEffectiveAddressRDI($5, textOffset));
+                parserStackPush(parserStack, loadEffectiveAddressRDI($5, leaPosition));
                 textOffset+= 7; // 1 byte rex, 1 byte opcode, 1 byte Mod R/M, 4 byte relative address
             }
         }

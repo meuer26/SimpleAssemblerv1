@@ -15,6 +15,8 @@ struct SymbolTable {
     char sectionName[30];
     int symbolLocation;
     int size;
+    int symIndex;    // index assigned in the ELF .symtab (0 = not emitted)
+    int strOffset;   // offset of this symbol's name in the ELF .strtab
 } symbolTable[MAXSYMBOLS];
 
 #endif

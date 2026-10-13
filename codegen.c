@@ -138,12 +138,14 @@ void codeGen(FILE *textFile, FILE *dataFile, ParseTree *parseTree, struct Symbol
        
         for(int x = 0; x < symbolTable->totalEntries; ++x)
         {
-            
-            if(!strcmp(symbolTable[x].symbolName, parseTree->string))
+            // Only match real symbols, not the RELODATA tracking entries that
+            // share the same name (those exist only to drive relocations).
+            if(!strcmp(symbolTable[x].symbolName, parseTree->string) &&
+               (!strcmp(symbolTable[x].symbolType, (char*)"String") || !strcmp(symbolTable[x].symbolType, (char*)"Label")))
             {
                 char rex = REX;
                 fwrite(&rex, sizeof(uint8_t), 1, textFile);
-                
+
                 char opcode = LOAD_EFFECTIVE_ADDRESS;
                 fwrite(&opcode, sizeof(uint8_t), 1, textFile);
 
@@ -158,7 +160,10 @@ void codeGen(FILE *textFile, FILE *dataFile, ParseTree *parseTree, struct Symbol
 
                 else if (!strcmp(symbolTable[x].sectionName, (char*)".data"))
                 {
-                    int relativeAddress = (0x1000 - parseTree->secondaryValue - 7) + symbolTable[x].symbolLocation; // minus 5 (size of this instruction)
+                    // Leave the displacement 0: the linker patches it using the
+                    // R_X86_64_PC32 relocation emitted in parser.y, so the
+                    // reference is correct no matter where ld places .data.
+                    int relativeAddress = 0;
                     fwrite(&relativeAddress, sizeof(int32_t), 1, textFile);
                 }
 
@@ -170,12 +175,14 @@ void codeGen(FILE *textFile, FILE *dataFile, ParseTree *parseTree, struct Symbol
        
         for(int x = 0; x < symbolTable->totalEntries; ++x)
         {
-            
-            if(!strcmp(symbolTable[x].symbolName, parseTree->string))
+            // Only match real symbols, not the RELODATA tracking entries that
+            // share the same name (those exist only to drive relocations).
+            if(!strcmp(symbolTable[x].symbolName, parseTree->string) &&
+               (!strcmp(symbolTable[x].symbolType, (char*)"String") || !strcmp(symbolTable[x].symbolType, (char*)"Label")))
             {
                 char rex = REX;
                 fwrite(&rex, sizeof(uint8_t), 1, textFile);
-                
+
                 char opcode = LOAD_EFFECTIVE_ADDRESS;
                 fwrite(&opcode, sizeof(uint8_t), 1, textFile);
 
@@ -190,8 +197,10 @@ void codeGen(FILE *textFile, FILE *dataFile, ParseTree *parseTree, struct Symbol
 
                 else if (!strcmp(symbolTable[x].sectionName, (char*)".data"))
                 {
-                    // data segment is 0x2000 away from text
-                    int relativeAddress = (0x2000 - parseTree->secondaryValue - 7) + symbolTable[x].symbolLocation; // minus 5 (size of this instruction)
+                    // Leave the displacement 0: the linker patches it using the
+                    // R_X86_64_PC32 relocation emitted in parser.y, so the
+                    // reference is correct no matter where ld places .data.
+                    int relativeAddress = 0;
                     fwrite(&relativeAddress, sizeof(int32_t), 1, textFile);
                 }
 
